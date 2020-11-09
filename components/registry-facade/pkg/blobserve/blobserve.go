@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/remotes"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/util"
 	"github.com/gitpod-io/gitpod/registry-facade/pkg/registry"
 	"github.com/gorilla/mux"
+	ociv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/xerrors"
 )
 
@@ -26,10 +28,26 @@ type Server struct {
 	Config   Config
 	Resolver registry.ResolverProvider
 
-	blobspace *blobspace
-	refcache  map[string]string
+	blobspace blobspace
+	refcache  map[string]*refInfo
 	mu        sync.RWMutex
 }
+
+type refInfo struct {
+	Layer  *ociv1.Descriptor
+	Digest string
+	State  refState
+	Done   chan struct{}
+}
+
+type refState int
+
+const (
+	refStateResolving refState = iota
+	refStateResolved
+	refStateDownloading
+	refStateDownloaded
+)
 
 // Config configures a server.
 type Config struct {
@@ -59,7 +77,7 @@ func NewServer(cfg Config, resolver registry.ResolverProvider) (*Server, error) 
 		Config:    cfg,
 		Resolver:  resolver,
 		blobspace: bs,
-		refcache:  make(map[string]string),
+		refcache:  make(map[string]*refInfo),
 	}
 	for repo, repoCfg := range cfg.Repos {
 		for _, ver := range repoCfg.PrePull {
@@ -182,33 +200,115 @@ func (reg *Server) Prepare(ctx context.Context, ref string) (err error) {
 
 func (reg *Server) blobFor(ctx context.Context, ref string, readOnly bool) (fs http.FileSystem, err error) {
 	reg.mu.RLock()
-	dgst := reg.refcache[ref]
+	info, exists := reg.refcache[ref]
 	reg.mu.RUnlock()
 
-	state := blobUnknown
-	if dgst != "" {
-		fs, state = reg.blobspace.Get(dgst)
-	}
-
-	if state == blobUnknown {
-		if readOnly {
-			return nil, errdefs.ErrNotFound
-		}
+	if !exists {
 		return reg.downloadBlobFor(ctx, ref)
 	}
 
-	if state != blobReady {
-		return nil, xerrors.Errorf("unready blob for %s", dgst)
+	fs, blobState := reg.blobspace.Get(info.Digest)
+	if blobState != blobReady {
+		return reg.downloadBlobFor(ctx, ref)
 	}
 
 	return fs, nil
 }
 
 func (reg *Server) downloadBlobFor(ctx context.Context, ref string) (fs http.FileSystem, err error) {
-	// TODO(cw): If multiple requests are made while the download happens we'll start multiple downloads (one per request).
-	//           Instead we should properly sync/manage/timeout state here.
+	reg.mu.Lock()
+	info, exists := reg.refcache[ref]
+
+	if !exists {
+		info = &refInfo{State: refStateResolving, Done: make(chan struct{})}
+		reg.refcache[ref] = info
+	}
+	reg.mu.Unlock()
+
+	if exists && info.State != refStateDownloaded {
+		// someone else is downloading the blob
+		select {
+		case <-info.Done:
+			if info.State != refStateDownloaded {
+				return nil, xerrors.Errorf("did not download blob")
+			}
+			fs, state := reg.blobspace.Get(info.Digest)
+			if state != blobReady {
+				return nil, xerrors.Errorf("did not download blob")
+			}
+			return fs, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	// At this point it's up to use to download the blob. No matter if we fail or succeed,
+	// we must tell the others.
+	defer func() {
+		if err != nil {
+			switch info.State {
+			case refStateResolving:
+				// we failed to resolve
+				reg.mu.Lock()
+				delete(reg.refcache, ref)
+				reg.mu.Unlock()
+			case refStateDownloading:
+				// we failed to download, but resolved the layer
+				info.State = refStateResolved
+			}
+		}
+		close(info.Done)
+	}()
 
 	resolver := reg.Resolver()
+	if info.State == refStateResolving {
+		info.Layer, err = resolveRef(ctx, ref, resolver)
+		if err != nil {
+			return nil, err
+		}
+		info.Digest = info.Layer.Digest.Hex()
+		info.State = refStateResolved
+	}
+
+	fetcher, err := resolver.Fetcher(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		fs, state := reg.blobspace.Get(info.Digest)
+		switch state {
+		case blobUnknown:
+			info.State = refStateDownloading
+
+			in, err := fetcher.Fetch(ctx, *info.Layer)
+			defer in.Close()
+			if err != nil {
+				return nil, err
+			}
+
+			log.WithField("digest", info.Digest).WithField("ref", ref).Info("downloading blob to serve over HTTP")
+			err = reg.blobspace.AddFromTarGzip(ctx, info.Digest, in)
+			if err != nil {
+				return nil, xerrors.Errorf("cannot download blob: %w", err)
+			}
+
+		case blobUnready:
+			if ctx.Err() != nil {
+				return nil, err
+			}
+
+			// TODO(cw): replace busy waiting on the blob becoming available with something mutex/channel based
+			time.Sleep(500 * time.Millisecond)
+
+		case blobReady:
+			info.State = refStateDownloaded
+			return fs, nil
+		}
+	}
+}
+
+func resolveRef(ctx context.Context, ref string, resolver remotes.Resolver) (*ociv1.Descriptor, error) {
 	_, desc, err := resolver.Resolve(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -217,7 +317,6 @@ func (reg *Server) downloadBlobFor(ctx context.Context, ref string) (fs http.Fil
 	if err != nil {
 		return nil, err
 	}
-
 	manifest, _, err := registry.DownloadManifest(ctx, fetcher, desc)
 	if err != nil {
 		return nil, err
@@ -232,39 +331,7 @@ func (reg *Server) downloadBlobFor(ctx context.Context, ref string) (fs http.Fil
 		log.WithField("ref", ref).Warn("image has more than one layers - serving from first layer only")
 	}
 	blobLayer := manifest.Layers[0]
-	dgst := blobLayer.Digest.Hex()
-
-	for {
-		fs, state := reg.blobspace.Get(dgst)
-		switch state {
-		case blobUnknown:
-			in, err := fetcher.Fetch(ctx, blobLayer)
-			defer in.Close()
-			if err != nil {
-				return nil, err
-			}
-
-			log.WithField("digest", dgst).WithField("ref", ref).Info("downloading blob to serve over HTTP")
-			err = reg.blobspace.AddFromTarGzip(ctx, dgst, in)
-			if err != nil {
-				return nil, xerrors.Errorf("cannot download blob: %w", err)
-			}
-
-		case blobUnready:
-			if ctx.Err() != nil {
-				return nil, err
-			}
-
-			// TODO: replace busy waiting on the blob becoming available with something mutex/channel based
-			time.Sleep(500 * time.Millisecond)
-
-		case blobReady:
-			reg.mu.Lock()
-			reg.refcache[ref] = dgst
-			reg.mu.Unlock()
-			return fs, nil
-		}
-	}
+	return &blobLayer, nil
 }
 
 type prefixingFilesystem struct {
