@@ -249,11 +249,12 @@ func downloadOTS(ctx context.Context, url string) (user, pwd string, err error) 
 type InitializeOpt func(*initializeOpts)
 
 type initializeOpts struct {
-	Initializer Initializer
-	CleanSlate  bool
-	InWorkspace bool
-	UID         int
-	GID         int
+	Initializer    Initializer
+	CleanSlate     bool
+	InWorkspace    bool
+	UID            int
+	GID            int
+	IgnoreChownErr bool
 }
 
 // WithInitializer configures the initializer that's used during content initialization
@@ -281,6 +282,11 @@ func WithChown(uid, gid int) InitializeOpt {
 	}
 }
 
+// WithIgnoreChownErrors makes chown caused issues warnings, not errors
+func WithIgnoreChownErrors(o *initializeOpts) {
+	o.IgnoreChownErr = true
+}
+
 // InitializeWorkspace initializes a workspace from backup or an initializer
 func InitializeWorkspace(ctx context.Context, location string, remoteStorage storage.DirectDownloader, opts ...InitializeOpt) (src csapi.WorkspaceInitSource, err error) {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "InitializeWorkspace")
@@ -288,11 +294,12 @@ func InitializeWorkspace(ctx context.Context, location string, remoteStorage sto
 	defer tracing.FinishSpan(span, &err)
 
 	cfg := initializeOpts{
-		Initializer: &EmptyInitializer{},
-		CleanSlate:  false,
-		InWorkspace: false,
-		GID:         GitpodGID,
-		UID:         GitpodUID,
+		Initializer:    &EmptyInitializer{},
+		CleanSlate:     false,
+		InWorkspace:    false,
+		GID:            GitpodGID,
+		UID:            GitpodUID,
+		IgnoreChownErr: false,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -326,6 +333,10 @@ func InitializeWorkspace(ctx context.Context, location string, remoteStorage sto
 		// Chown the workspace directory
 		err = os.Chown(location, cfg.UID, cfg.GID)
 		if err != nil {
+			if cfg.IgnoreChownErr {
+				log.WithError(err).Warnf("cannot chown %s", location)
+				err = nil
+			}
 			return src, xerrors.Errorf("cannot create workspace: %w", err)
 		}
 	}
@@ -349,6 +360,11 @@ func InitializeWorkspace(ctx context.Context, location string, remoteStorage sto
 	if !cfg.InWorkspace {
 		err = recursiveChown(ctx, location, cfg.UID, cfg.GID)
 		if err != nil {
+			if cfg.IgnoreChownErr {
+				log.WithError(err).Warnf("cannot chown %s", location)
+				err = nil
+			}
+
 			return src, xerrors.Errorf("cannot set workspace permissions: %w", err)
 		}
 	}

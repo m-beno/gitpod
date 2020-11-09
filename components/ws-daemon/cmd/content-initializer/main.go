@@ -6,7 +6,6 @@ package main
 
 import (
 	"os"
-	"time"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
@@ -20,7 +19,6 @@ func main() {
 	err := content.RunInitializerChild()
 	if err != nil {
 		log.WithError(err).Error("content init failed")
-		time.Sleep(30 * time.Minute)
 		os.Exit(42)
 	}
 }
